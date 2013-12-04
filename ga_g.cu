@@ -8,15 +8,15 @@
 
 #define POP 300
 #define LEN 30
-#define MUT 0.1
-#define REC 0.5
+#define MUT 10
+#define REC 50
 #define END 10000
 #define SUMTAG 150
 #define PRODTAG 3600
 
 int gene[POP][LEN];
 int value[POP][LEN];
-
+int seed[POP][LEN];
 void init_pop();
 double evaluate(int n);
 void run();
@@ -30,6 +30,13 @@ double random_double(){
   return d; 
 }
 
+__device__ unsigned int get_rand(int range, int* seed){
+  *seed ^= (*seed << 13);
+  *seed ^= (*seed >> 17);
+  *seed ^= (*seed << 5);
+  return *seed % range;
+}
+         
 __global__ void comput_kernel(double* score, int* gene, int* value){
   int offset = blockIdx.x * LEN;
   //evaluate
@@ -51,14 +58,24 @@ __global__ void comput_kernel(double* score, int* gene, int* value){
     scaled_prod_error *= -1;
   
   score[blockIdx.x] = scaled_sum_error + scaled_prod_error;
+  
 }
 
 __global__ void find_min_score(double *score, double* min_score, int *min_idx){
   int low_idx = -1;
   double low = 0;
   
+  __shared__ double shared_score[POP];
+
+  for(int i = threadIdx.x; i < POP; i += blockDim.x)
+    shared_score[i] = score[i];
+  
+  __syncthreads();
+  if(threadIdx.x != 0)
+    return;
+
   for(int i = 0; i < POP; ++i)
-    if(score[i] < low || low_idx == -1){
+    if(shared_score[i] < low || low_idx == -1){
       low = score[i];
       low_idx = i;
     }
@@ -68,8 +85,22 @@ __global__ void find_min_score(double *score, double* min_score, int *min_idx){
 }
 
 
-__global__ void mutate_kernel(int* gene, int *min_idx){
+__global__ void mutate_kernel(int* gene, int *min_idx, int* seed){
+  if(blockIdx.x == *min_idx)
+    return;
 
+  int offset = blockIdx.x * LEN;
+  int min_offset = *min_idx * LEN;
+  int reg_seed = seed[blockIdx.x * LEN + threadIdx.x];
+
+  //for(int i = 0; i < LEN; ++i){
+  if(get_rand(100, &reg_seed) < REC)
+    gene[offset + threadIdx.x] = gene[min_offset + threadIdx.x];
+  if(get_rand(100, &reg_seed) < MUT)
+    gene[offset + threadIdx.x] = 1 - gene[offset + threadIdx.x];
+  //}
+
+  seed[blockIdx.x * LEN + threadIdx.x] = reg_seed;
 }
 
 void run(){
@@ -83,48 +114,32 @@ void run(){
   double* score_d;
   double* min_score;
   int* min_idx;
+  int* seed_d;
 
   cudaMalloc((void**)&gene_d, sizeof(int) * POP * LEN); 
   cudaMalloc((void**)&value_d, sizeof(int) * POP * LEN); 
   cudaMalloc((void**)&score_d, sizeof(double) * POP); 
-  cudaMalloc((void**)&min_score, sizeof(double) * POP); 
-  cudaMalloc((void**)&min_idx, sizeof(int) * POP); 
+  cudaMalloc((void**)&seed_d, sizeof(int) * POP * LEN); 
+  cudaMalloc((void**)&min_score, sizeof(double)); 
+  cudaMalloc((void**)&min_idx, sizeof(int)); 
   
+
+  cudaMemcpy(gene_d, gene, sizeof(int) * POP * LEN, cudaMemcpyHostToDevice);
+  cudaMemcpy(value_d, value, sizeof(int) * POP * LEN, cudaMemcpyHostToDevice);
+  cudaMemcpy(score_d, score, sizeof(double) * POP, cudaMemcpyHostToDevice);
+  cudaMemcpy(seed_d, seed, sizeof(int) * POP * LEN, cudaMemcpyHostToDevice);
+
   dim3 dimGrid(POP, 1);
   dim3 dimBlock(1, 1);
 
   for(tournamentNo = 0; tournamentNo < END; tournamentNo++){
-   
     comput_kernel<<<dimGrid, dimBlock>>>(score_d, gene_d, value_d);
-    find_min_score<<<1, 1>>>(score_d, min_score, min_idx); 
-    mutate_kernel<<<dimGrid, dimBlock>>>(gene_d, min_id);
-
-
-    /*for(int i = 0; i < POP; ++i){
-        score[i] = evaluate(i);
-        if(low_idx == -1 || low > score[i]){
-          low = score[i];
-          low_idx = i;
-        }
-      }
-      if(low == 0.0) 
-          break;
-      for(int j = 0; j < POP; ++j)
-        if(j != low_idx){
-          for(int i = 0; i < LEN; i++){
-              if(random_double() < REC){
-                  gene[j][i] = gene[low_idx][i];
-              }
-              if(random_double() < MUT){
-                  gene[j][i] = 1 - gene[j][i];  
-              }
-          }        
-            score[j] = evaluate(j);
-          if(score[j] == 0.0)
-              break;
-      }
-      */
+    find_min_score<<<1, 128>>>(score_d, min_score, min_idx); 
+    mutate_kernel<<<dimGrid, LEN>>>(gene_d, min_idx, seed_d);
   }
+  
+  cudaMemcpy(gene, gene_d, sizeof(int) * POP * LEN, cudaMemcpyDeviceToHost);
+  cudaMemcpy(score, score_d, sizeof(double) * POP, cudaMemcpyDeviceToHost);
   
   low_idx = -1;
   low = 0;
@@ -171,6 +186,10 @@ void display(int tournaments, int n){
           printf("%d ", value[n][i]);
       } 
   }
+  
+  for(int i = 0; i < LEN; i++)
+      assert(gene[n][i] == 1 || gene[n][i] == 0);
+
   printf("\n");
 }
 
@@ -212,6 +231,10 @@ void init_pop(){
           value[i][j] = rand() % 9 + 1;
       }
   }
+
+  for(int i = 0; i < POP; ++i)
+    for(int j = 0; j < LEN; ++j)
+    seed[i][j] = rand() % 10000000;
 }
 
 int main(){
