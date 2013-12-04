@@ -149,8 +149,8 @@ void run(){
   
   if(low_idx != -1){
     //printf("%f %f\n", low, evaluate(low_idx));
-    display(tournamentNo, low_idx);
     get_result(low_idx);
+    display(tournamentNo, low_idx);
   }
 }
 
